@@ -1,12 +1,12 @@
 const { Client, GatewayIntentBits, Partials, Collection, EmbedBuilder, REST, Routes } = require('discord.js');
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');
 
 // ----------------------
 // DATABASE SETUP
 // ----------------------
-const db = new sqlite3.Database('./invites.db');
+const db = new Database('./invites.db');
 
-db.run(`
+db.prepare(`
 CREATE TABLE IF NOT EXISTS invite_stats (
     user_id TEXT PRIMARY KEY,
     joins INTEGER DEFAULT 0,
@@ -15,22 +15,21 @@ CREATE TABLE IF NOT EXISTS invite_stats (
     rejoins INTEGER DEFAULT 0,
     last_verified INTEGER DEFAULT 0
 )
-`);
+`).run();
 
 function getStats(userId) {
-    return new Promise((resolve) => {
-        db.get(`SELECT * FROM invite_stats WHERE user_id = ?`, [userId], (err, row) => {
-            if (!row) {
-                db.run(`INSERT INTO invite_stats (user_id) VALUES (?)`, [userId]);
-                return resolve({ joins: 0, leaves: 0, fake: 0, rejoins: 0, last_verified: 0 });
-            }
-            resolve(row);
-        });
-    });
+    let row = db.prepare(`SELECT * FROM invite_stats WHERE user_id = ?`).get(userId);
+
+    if (!row) {
+        db.prepare(`INSERT INTO invite_stats (user_id) VALUES (?)`).run(userId);
+        row = { user_id: userId, joins: 0, leaves: 0, fake: 0, rejoins: 0, last_verified: 0 };
+    }
+
+    return row;
 }
 
-function updateStat(userId, field) {
-    db.run(`UPDATE invite_stats SET ${field} = ${field} + 1 WHERE user_id = ?`, [userId]);
+function increment(userId, field) {
+    db.prepare(`UPDATE invite_stats SET ${field} = ${field} + 1 WHERE user_id = ?`).run(userId);
 }
 
 // ----------------------
@@ -44,8 +43,6 @@ const client = new Client({
     ],
     partials: [Partials.GuildMember]
 });
-
-client.commands = new Collection();
 
 // ----------------------
 // SLASH COMMANDS
@@ -95,32 +92,32 @@ async function loadInvites(guild) {
 client.on("ready", async () => {
     console.log(`Logged in as ${client.user.tag}`);
 
-    client.guilds.cache.forEach(async (guild) => {
+    for (const guild of client.guilds.cache.values()) {
         await loadInvites(guild);
-    });
+    }
 });
 
 // ----------------------
 // INVITE TRACKING
 // ----------------------
 client.on("guildMemberAdd", async (member) => {
-    const cachedInvites = inviteCache.get(member.guild.id);
+    const cached = inviteCache.get(member.guild.id);
     const newInvites = await member.guild.invites.fetch();
 
-    const usedInvite = newInvites.find(inv => {
-        const old = cachedInvites.get(inv.code);
+    const used = newInvites.find(inv => {
+        const old = cached.get(inv.code);
         return old && inv.uses > old.uses;
     });
 
-    if (usedInvite) {
-        updateStat(usedInvite.inviter.id, "joins");
+    if (used) {
+        increment(used.inviter.id, "joins");
     }
 
     inviteCache.set(member.guild.id, newInvites);
 });
 
 client.on("guildMemberRemove", async (member) => {
-    updateStat(member.id, "leaves");
+    increment(member.id, "leaves");
 });
 
 // ----------------------
@@ -133,7 +130,7 @@ client.on("interactionCreate", async (interaction) => {
 
     // /invites
     if (interaction.commandName === "invites") {
-        const stats = await getStats(userId);
+        const stats = getStats(userId);
         const total = stats.joins - stats.leaves - stats.fake + stats.rejoins;
 
         const embed = new EmbedBuilder()
@@ -153,7 +150,7 @@ client.on("interactionCreate", async (interaction) => {
 
     // /verify invite
     if (interaction.commandName === "verify") {
-        const stats = await getStats(userId);
+        const stats = getStats(userId);
 
         if (stats.joins <= stats.last_verified) {
             return interaction.reply({
@@ -162,7 +159,7 @@ client.on("interactionCreate", async (interaction) => {
             });
         }
 
-        db.run(`UPDATE invite_stats SET last_verified = joins WHERE user_id = ?`, [userId]);
+        db.prepare(`UPDATE invite_stats SET last_verified = joins WHERE user_id = ?`).run(userId);
 
         const total = stats.joins - stats.leaves - stats.fake + stats.rejoins;
 
