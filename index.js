@@ -1,206 +1,179 @@
-
-const { Client, GatewayIntentBits, Partials, SlashCommandBuilder, Routes, REST } = require("discord.js");
-const Database = require("better-sqlite3");
-
-// ----------------------
-// CONFIGURATION
-// ----------------------
-const TOKEN = process.env.TOKEN;
-
-// Channels
-const LOG_CHANNEL = "1516529531622658118";
-const VERIFY_CHANNEL = "1516506978350796842";
-
-// Reward Roles
-const ROLE_5_INVITES = "1516530180120907988";
-const ROLE_10_INVITES = "1516530257069342841";
+const { Client, GatewayIntentBits, Partials, Collection, EmbedBuilder, REST, Routes } = require('discord.js');
+const sqlite3 = require('sqlite3').verbose();
 
 // ----------------------
 // DATABASE SETUP
 // ----------------------
-const db = new Database("invites.sqlite");
+const db = new sqlite3.Database('./invites.db');
 
-db.prepare(`
-  CREATE TABLE IF NOT EXISTS invites (
+db.run(`
+CREATE TABLE IF NOT EXISTS invite_stats (
     user_id TEXT PRIMARY KEY,
-    inviter_id TEXT,
-    count INTEGER DEFAULT 0
-  )
-`).run();
+    joins INTEGER DEFAULT 0,
+    leaves INTEGER DEFAULT 0,
+    fake INTEGER DEFAULT 0,
+    rejoins INTEGER DEFAULT 0,
+    last_verified INTEGER DEFAULT 0
+)
+`);
 
-db.prepare(`
-  CREATE TABLE IF NOT EXISTS invite_codes (
-    code TEXT PRIMARY KEY,
-    inviter_id TEXT,
-    uses INTEGER DEFAULT 0
-  )
-`).run();
+function getStats(userId) {
+    return new Promise((resolve) => {
+        db.get(`SELECT * FROM invite_stats WHERE user_id = ?`, [userId], (err, row) => {
+            if (!row) {
+                db.run(`INSERT INTO invite_stats (user_id) VALUES (?)`, [userId]);
+                return resolve({ joins: 0, leaves: 0, fake: 0, rejoins: 0, last_verified: 0 });
+            }
+            resolve(row);
+        });
+    });
+}
+
+function updateStat(userId, field) {
+    db.run(`UPDATE invite_stats SET ${field} = ${field} + 1 WHERE user_id = ?`, [userId]);
+}
 
 // ----------------------
 // DISCORD CLIENT
 // ----------------------
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildInvites
-  ],
-  partials: [Partials.GuildMember]
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildInvites
+    ],
+    partials: [Partials.GuildMember]
 });
 
+client.commands = new Collection();
+
 // ----------------------
-// REGISTER SLASH COMMANDS
+// SLASH COMMANDS
 // ----------------------
 const commands = [
-  new SlashCommandBuilder()
-    .setName("verify")
-    .setDescription("Verify an invite code")
-    .addStringOption(option =>
-      option.setName("code")
-        .setDescription("The invite code to verify")
-        .setRequired(true)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("invites")
-    .setDescription("Check your invite count")
+    {
+        name: "invites",
+        description: "Show your invite statistics"
+    },
+    {
+        name: "verify",
+        description: "Verify your most recent invite",
+        options: [
+            {
+                name: "invite",
+                description: "Verify your latest invite",
+                type: 1
+            }
+        ]
+    }
 ];
 
-const rest = new REST({ version: "10" }).setToken(TOKEN);
+const rest = new REST({ version: "10" }).setToken(process.env.TOKEN);
 
-client.once("ready", async () => {
-  console.log(`Logged in as ${client.user.tag}`);
+(async () => {
+    try {
+        await rest.put(
+            Routes.applicationCommands(process.env.CLIENT_ID),
+            { body: commands }
+        );
+        console.log("Slash commands registered.");
+    } catch (err) {
+        console.error(err);
+    }
+})();
 
-  await rest.put(
-    Routes.applicationCommands(client.user.id),
-    { body: commands }
-  );
+// ----------------------
+// INVITE CACHE
+// ----------------------
+const inviteCache = new Map();
 
-  console.log("Slash commands registered.");
+async function loadInvites(guild) {
+    const invites = await guild.invites.fetch();
+    inviteCache.set(guild.id, invites);
+}
+
+client.on("ready", async () => {
+    console.log(`Logged in as ${client.user.tag}`);
+
+    client.guilds.cache.forEach(async (guild) => {
+        await loadInvites(guild);
+    });
 });
 
 // ----------------------
 // INVITE TRACKING
 // ----------------------
-let cachedInvites = new Map();
+client.on("guildMemberAdd", async (member) => {
+    const cachedInvites = inviteCache.get(member.guild.id);
+    const newInvites = await member.guild.invites.fetch();
 
-client.on("inviteCreate", async invite => {
-  cachedInvites.set(invite.code, invite.uses);
-});
+    const usedInvite = newInvites.find(inv => {
+        const old = cachedInvites.get(inv.code);
+        return old && inv.uses > old.uses;
+    });
 
-client.on("ready", async () => {
-  const guild = client.guilds.cache.first();
-  const invites = await guild.invites.fetch();
-
-  invites.forEach(inv => {
-    cachedInvites.set(inv.code, inv.uses);
-  });
-});
-
-// ----------------------
-// MEMBER JOIN
-// ----------------------
-client.on("guildMemberAdd", async member => {
-  const guild = member.guild;
-  const newInvites = await guild.invites.fetch();
-
-  let usedInvite = null;
-
-  newInvites.forEach(inv => {
-    const oldUses = cachedInvites.get(inv.code);
-    if (oldUses < inv.uses) usedInvite = inv;
-  });
-
-  newInvites.forEach(inv => cachedInvites.set(inv.code, inv.uses));
-
-  const logChannel = guild.channels.cache.get(LOG_CHANNEL);
-
-  if (!usedInvite) {
-    logChannel?.send(`❓ ${member.user.tag} joined but I couldn't detect the invite.`);
-    return;
-  }
-
-  const inviterId = usedInvite.inviter.id;
-
-  // Update database
-  const row = db.prepare("SELECT count FROM invites WHERE user_id = ?").get(inviterId);
-
-  if (!row) {
-    db.prepare("INSERT INTO invites (user_id, inviter_id, count) VALUES (?, ?, ?)").run(inviterId, inviterId, 1);
-  } else {
-    db.prepare("UPDATE invites SET count = ? WHERE user_id = ?").run(row.count + 1, inviterId);
-  }
-
-  logChannel?.send(`📥 **${member.user.tag}** joined using **${usedInvite.code}** from <@${inviterId}>`);
-
-  // Reward roles
-  const inviter = guild.members.cache.get(inviterId);
-  const newCount = db.prepare("SELECT count FROM invites WHERE user_id = ?").get(inviterId).count;
-
-  if (newCount >= 5) inviter.roles.add(ROLE_5_INVITES).catch(() => {});
-  if (newCount >= 10) inviter.roles.add(ROLE_10_INVITES).catch(() => {});
-});
-
-// ----------------------
-// MEMBER LEAVE
-// ----------------------
-client.on("guildMemberRemove", async member => {
-  const guild = member.guild;
-  const logChannel = guild.channels.cache.get(LOG_CHANNEL);
-
-  const row = db.prepare("SELECT inviter_id FROM invites WHERE user_id = ?").get(member.id);
-
-  if (!row) return;
-
-  const inviterId = row.inviter_id;
-
-  const inviterRow = db.prepare("SELECT count FROM invites WHERE user_id = ?").get(inviterId);
-  if (!inviterRow) return;
-
-  const newCount = Math.max(0, inviterRow.count - 1);
-
-  db.prepare("UPDATE invites SET count = ? WHERE user_id = ?").run(newCount, inviterId);
-
-  logChannel?.send(`📤 **${member.user.tag}** left. Removing 1 invite from <@${inviterId}>`);
-
-  const inviter = guild.members.cache.get(inviterId);
-
-  if (newCount < 5) inviter.roles.remove(ROLE_5_INVITES).catch(() => {});
-  if (newCount < 10) inviter.roles.remove(ROLE_10_INVITES).catch(() => {});
-});
-
-// ----------------------
-// /verify COMMAND
-// ----------------------
-client.on("interactionCreate", async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === "verify") {
-    const code = interaction.options.getString("code");
-
-    const row = db.prepare("SELECT inviter_id FROM invite_codes WHERE code = ?").get(code);
-
-    const channel = interaction.guild.channels.cache.get(VERIFY_CHANNEL);
-
-    if (!row) {
-      channel?.send(`❌ Invalid invite code: **${code}**`);
-      return interaction.reply({ content: "Invalid code.", ephemeral: true });
+    if (usedInvite) {
+        updateStat(usedInvite.inviter.id, "joins");
     }
 
-    channel?.send(`✅ Invite code **${code}** verified! Inviter: <@${row.inviter_id}>`);
-    return interaction.reply({ content: "Invite verified!", ephemeral: true });
-  }
+    inviteCache.set(member.guild.id, newInvites);
+});
 
-  if (interaction.commandName === "invites") {
-    const row = db.prepare("SELECT count FROM invites WHERE user_id = ?").get(interaction.user.id);
+client.on("guildMemberRemove", async (member) => {
+    updateStat(member.id, "leaves");
+});
 
-    const count = row ? row.count : 0;
+// ----------------------
+// COMMAND HANDLER
+// ----------------------
+client.on("interactionCreate", async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
 
-    return interaction.reply(`📊 You have **${count}** invites.`);
-  }
+    const userId = interaction.user.id;
+
+    // /invites
+    if (interaction.commandName === "invites") {
+        const stats = await getStats(userId);
+        const total = stats.joins - stats.leaves - stats.fake + stats.rejoins;
+
+        const embed = new EmbedBuilder()
+            .setTitle("📊 Invite Log")
+            .setDescription(
+                `🪪 **${interaction.user.username}** has **${total}** invites\n\n` +
+                `📥 **Joins:** ${stats.joins}\n` +
+                `📤 **Left:** ${stats.leaves}\n` +
+                `⚠️ **Fake:** ${stats.fake}\n` +
+                `🔄 **Rejoins:** ${stats.rejoins} (7d)\n\n`
+            )
+            .setFooter({ text: `Requested by ${interaction.user.username} • Today` })
+            .setColor("#2b2d31");
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    // /verify invite
+    if (interaction.commandName === "verify") {
+        const stats = await getStats(userId);
+
+        if (stats.joins <= stats.last_verified) {
+            return interaction.reply({
+                content: "❌ No new invites detected.",
+                ephemeral: true
+            });
+        }
+
+        db.run(`UPDATE invite_stats SET last_verified = joins WHERE user_id = ?`, [userId]);
+
+        const total = stats.joins - stats.leaves - stats.fake + stats.rejoins;
+
+        return interaction.reply({
+            content: `✅ Invite verified! You now have **${total}** invites.`,
+            ephemeral: true
+        });
+    }
 });
 
 // ----------------------
 // LOGIN
 // ----------------------
-client.login(TOKEN);
+client.login(process.env.TOKEN);
