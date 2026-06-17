@@ -1,4 +1,12 @@
-const { Client, GatewayIntentBits, Partials, Collection, EmbedBuilder, REST, Routes } = require('discord.js');
+const { 
+    Client, 
+    GatewayIntentBits, 
+    Partials, 
+    EmbedBuilder, 
+    REST, 
+    Routes 
+} = require('discord.js');
+
 const Database = require('better-sqlite3');
 
 // ----------------------
@@ -101,7 +109,14 @@ client.on("ready", async () => {
 // INVITE TRACKING
 // ----------------------
 client.on("guildMemberAdd", async (member) => {
-    const cached = inviteCache.get(member.guild.id);
+    let cached = inviteCache.get(member.guild.id);
+
+    if (!cached) {
+        const initialInvites = await member.guild.invites.fetch();
+        inviteCache.set(member.guild.id, initialInvites);
+        cached = initialInvites;
+    }
+
     const newInvites = await member.guild.invites.fetch();
 
     const used = newInvites.find(inv => {
@@ -111,6 +126,9 @@ client.on("guildMemberAdd", async (member) => {
 
     if (used) {
         increment(used.inviter.id, "joins");
+        console.log(`Invite used by ${member.user.tag}, inviter: ${used.inviter.tag}`);
+    } else {
+        console.log(`No matching invite found for ${member.user.tag}`);
     }
 
     inviteCache.set(member.guild.id, newInvites);
@@ -162,6 +180,43 @@ client.on("interactionCreate", async (interaction) => {
         db.prepare(`UPDATE invite_stats SET last_verified = joins WHERE user_id = ?`).run(userId);
 
         const total = stats.joins - stats.leaves - stats.fake + stats.rejoins;
+
+        // ----------------------
+        // REWARD SYSTEM
+        // ----------------------
+        const rewardChannel = interaction.guild.channels.cache.get("1516506978350796842");
+
+        // 5 INVITES
+        if (total === 5) {
+            const role = interaction.guild.roles.cache.get("1516530180120907988");
+            interaction.member.roles.add(role).catch(() => {});
+
+            const embed = new EmbedBuilder()
+                .setTitle("🎉 5th Invite Verified!")
+                .setDescription(
+                    `You earned a **Rainbow Seed** 🌈🌱\n` +
+                    `Go to **Ticket service🎫 → claim-reward🎫** to claim your reward.`
+                )
+                .setColor("#00ff9d");
+
+            rewardChannel.send({ embeds: [embed] });
+        }
+
+        // 10 INVITES
+        if (total === 10) {
+            const role = interaction.guild.roles.cache.get("1516530257069342841");
+            interaction.member.roles.add(role).catch(() => {});
+
+            const embed = new EmbedBuilder()
+                .setTitle("🎉 10th Invite Verified!")
+                .setDescription(
+                    `You earned a **Dragon Breath** 🐉🔥\n` +
+                    `Go to **Ticket service🎫 → claim-reward🎫** to claim your reward.`
+                )
+                .setColor("#ff6b00");
+
+            rewardChannel.send({ embeds: [embed] });
+        }
 
         return interaction.reply({
             content: `✅ Invite verified! You now have **${total}** invites.`,
